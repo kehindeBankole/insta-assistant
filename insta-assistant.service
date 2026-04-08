@@ -1,0 +1,15 @@
+[Unit]
+Description=Insta Assistant Webhook
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/insta-assistant
+EnvironmentFile=/opt/insta-assistant/.env
+ExecStart=/opt/insta-assistant/insta-assistant
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
