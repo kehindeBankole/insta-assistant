@@ -77,6 +77,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	http.HandleFunc("/privacy", app.handlePrivacy)
+	http.HandleFunc("/data-deletion", app.handleDataDeletion)
 	http.HandleFunc("/ig-webhook", app.handleIGWebhook)
 
 	log.Printf("insta-assistant listening on :%s", cfg.Port)
@@ -126,6 +128,7 @@ func loadConfig() Config {
 }
 
 func (a *App) handleIGWebhook(w http.ResponseWriter, r *http.Request) {
+	log.Printf("webhook hit method=%s path=%s ua=%q remote=%s", r.Method, r.URL.Path, r.UserAgent(), r.RemoteAddr)
 	switch r.Method {
 	case http.MethodGet:
 		a.handleVerify(w, r)
@@ -140,6 +143,7 @@ func (a *App) handleVerify(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("hub.mode")
 	token := r.URL.Query().Get("hub.verify_token")
 	challenge := r.URL.Query().Get("hub.challenge")
+	log.Printf("verify attempt mode=%q token_match=%t challenge_len=%d", mode, token == a.cfg.VerifyToken, len(challenge))
 	if mode == "subscribe" && token == a.cfg.VerifyToken {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(challenge))
@@ -160,6 +164,17 @@ type incoming struct {
 				IsEcho bool   `json:"is_echo"`
 			} `json:"message"`
 		} `json:"messaging"`
+		Changes []struct {
+			Field string `json:"field"`
+			Value struct {
+				Sender struct {
+					ID string `json:"id"`
+				} `json:"sender"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"value"`
+		} `json:"changes"`
 	} `json:"entry"`
 }
 
@@ -169,10 +184,17 @@ func (a *App) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
-	if a.cfg.AppSecret != "" && !verifyMetaSignature(a.cfg.AppSecret, body, r.Header.Get("X-Hub-Signature-256")) {
+	sig := r.Header.Get("X-Hub-Signature-256")
+	if a.cfg.AppSecret != "" && !verifyMetaSignature(a.cfg.AppSecret, body, sig) {
+		log.Printf("post rejected invalid signature sig_present=%t body_len=%d", sig != "", len(body))
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
+	preview := string(body)
+	if len(preview) > 2000 {
+		preview = preview[:2000] + "..."
+	}
+	log.Printf("post received sig_present=%t body_len=%d payload=%s", sig != "", len(body), preview)
 
 	var in incoming
 	if err := json.Unmarshal(body, &in); err != nil {
@@ -180,6 +202,7 @@ func (a *App) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	processed := 0
 	for _, e := range in.Entry {
 		for _, m := range e.Messaging {
 			sender := m.Sender.ID
@@ -187,8 +210,32 @@ func (a *App) handleMessage(w http.ResponseWriter, r *http.Request) {
 			if sender == "" || text == "" || m.Message.IsEcho {
 				continue
 			}
+			processed++
+			log.Printf("message accepted (messaging) sender=%s text_len=%d", sender, len(text))
 			go a.processIncoming(sender, text)
 		}
+		for _, c := range e.Changes {
+			if c.Field != "messages" {
+				continue
+			}
+			sender := c.Value.Sender.ID
+			text := strings.TrimSpace(c.Value.Message.Text)
+			if sender == "" || text == "" {
+				continue
+			}
+			processed++
+			log.Printf("message accepted (changes) sender=%s text_len=%d", sender, len(text))
+			go a.processIncoming(sender, text)
+		}
+	}
+	if processed == 0 {
+		preview := string(body)
+		if len(preview) > 1200 {
+			preview = preview[:1200] + "..."
+		}
+		log.Printf("post parsed entries=%d processed_messages=%d raw_preview=%s", len(in.Entry), processed, preview)
+	} else {
+		log.Printf("post parsed entries=%d processed_messages=%d", len(in.Entry), processed)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -248,7 +295,7 @@ func trimTurns(turns []Turn, n int) []Turn {
 
 func (a *App) generateReply(turns []Turn) (string, error) {
 	if a.cfg.OpenAIAPIKey == "" {
-		return "", errors.New("OPENAI_API_KEY missing")
+		return "Thanks for your message — we got it. A human will reply shortly.", nil
 	}
 	type msg struct {
 		Role    string `json:"role"`
@@ -295,10 +342,22 @@ func (a *App) generateReply(turns []Turn) (string, error) {
 }
 
 func (a *App) sendIGMessage(recipientID, text string) error {
-	if a.cfg.IGUserID == "" || a.cfg.IGPageAccessToken == "" {
+	igUserID := strings.TrimSpace(a.cfg.IGUserID)
+	accessToken := strings.TrimSpace(a.cfg.IGPageAccessToken)
+	recipientID = strings.TrimSpace(recipientID)
+	text = strings.TrimSpace(text)
+
+	if igUserID == "" || accessToken == "" {
 		return errors.New("IG_USER_ID or IG_PAGE_ACCESS_TOKEN missing")
 	}
-	url := fmt.Sprintf("https://graph.facebook.com/v23.0/%s/messages?access_token=%s", a.cfg.IGUserID, a.cfg.IGPageAccessToken)
+	if recipientID == "" {
+		return errors.New("recipientID missing")
+	}
+	if text == "" {
+		return errors.New("message text missing")
+	}
+
+	url := fmt.Sprintf("https://graph.facebook.com/v23.0/%s/messages?access_token=%s", igUserID, accessToken)
 	payload := map[string]any{
 		"messaging_product": "instagram",
 		"recipient":         map[string]any{"id": recipientID},
@@ -385,4 +444,55 @@ func (a *App) listThreads() ([]ThreadState, error) {
 		})
 	})
 	return out, err
+}
+
+func (a *App) handlePrivacy(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Insta Assistant Privacy Policy</title></head>
+<body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;line-height:1.6;padding:0 16px;">
+<h1>Privacy Policy — Insta Assistant</h1>
+<p>Effective date: 2026-04-09</p>
+<p>Insta Assistant is an automation service that responds to Instagram direct messages for the connected business account.</p>
+<h2>Data we process</h2>
+<ul>
+  <li>Instagram sender ID</li>
+  <li>Message text and timestamps</li>
+  <li>Webhook metadata required for message delivery and security verification</li>
+</ul>
+<h2>Purpose of processing</h2>
+<ul>
+  <li>Generate and send automated replies</li>
+  <li>Maintain short conversation memory for context continuity</li>
+  <li>Send optional follow-up messages if enabled</li>
+</ul>
+<h2>Storage and retention</h2>
+<p>Conversation data is stored on a secured VPS and retained only as needed for bot operation and troubleshooting.</p>
+<h2>Third-party processors</h2>
+<ul>
+  <li>Meta Platforms (Instagram Graph API / Webhooks)</li>
+  <li>OpenAI (only when AI-generated replies are enabled)</li>
+</ul>
+<h2>Your rights</h2>
+<p>You may request access, correction, or deletion of your data via the data deletion instructions below.</p>
+<h2>Contact</h2>
+<p>Email: bankolek1@gmail.com</p>
+<p>Data deletion instructions: <a href="/data-deletion">/data-deletion</a></p>
+</body></html>`))
+}
+
+func (a *App) handleDataDeletion(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Insta Assistant Data Deletion</title></head>
+<body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;line-height:1.6;padding:0 16px;">
+<h1>Data Deletion Instructions — Insta Assistant</h1>
+<p>To request deletion of your Instagram conversation data processed by Insta Assistant:</p>
+<ol>
+  <li>Send an email to <strong>bankolek1@gmail.com</strong> with subject: <em>Data Deletion Request</em>.</li>
+  <li>Include your Instagram handle and approximate date/time of your last message.</li>
+  <li>We will process and confirm deletion within 7 business days.</li>
+</ol>
+<p>If you are contacting from within Instagram, you may also send: <strong>DELETE MY DATA</strong> in DM to trigger manual review.</p>
+</body></html>`))
 }
