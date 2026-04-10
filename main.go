@@ -25,6 +25,7 @@ type Config struct {
 	VerifyToken        string
 	AppSecret          string
 	IGUserID           string
+	IGPageID           string
 	IGPageAccessToken  string
 	OpenAIAPIKey       string
 	OpenAIModel        string
@@ -117,6 +118,7 @@ func loadConfig() Config {
 		VerifyToken:        os.Getenv("IG_VERIFY_TOKEN"),
 		AppSecret:          os.Getenv("IG_APP_SECRET"),
 		IGUserID:           os.Getenv("IG_USER_ID"),
+		IGPageID:           os.Getenv("IG_PAGE_ID"),
 		IGPageAccessToken:  os.Getenv("IG_PAGE_ACCESS_TOKEN"),
 		OpenAIAPIKey:       os.Getenv("OPENAI_API_KEY"),
 		OpenAIModel:        model,
@@ -342,14 +344,12 @@ func (a *App) generateReply(turns []Turn) (string, error) {
 }
 
 func (a *App) sendIGMessage(recipientID, text string) error {
-	igUserID := strings.TrimSpace(a.cfg.IGUserID)
-	accessToken := strings.TrimSpace(a.cfg.IGPageAccessToken)
+	if a.cfg.IGPageID == "" || a.cfg.IGPageAccessToken == "" {
+		return errors.New("IG_PAGE_ID or IG_PAGE_ACCESS_TOKEN missing")
+	}
+
 	recipientID = strings.TrimSpace(recipientID)
 	text = strings.TrimSpace(text)
-
-	if igUserID == "" || accessToken == "" {
-		return errors.New("IG_USER_ID or IG_PAGE_ACCESS_TOKEN missing")
-	}
 	if recipientID == "" {
 		return errors.New("recipientID missing")
 	}
@@ -357,22 +357,49 @@ func (a *App) sendIGMessage(recipientID, text string) error {
 		return errors.New("message text missing")
 	}
 
-	url := fmt.Sprintf("https://graph.facebook.com/v23.0/%s/messages?access_token=%s", igUserID, accessToken)
-	payload := map[string]any{
-		"messaging_product": "instagram",
-		"recipient":         map[string]any{"id": recipientID},
-		"message":           map[string]any{"text": text},
+	payload := map[string]interface{}{
+		"recipient": map[string]string{
+			"id": recipientID,
+		},
+		"message": map[string]string{
+			"text": text,
+		},
+		"messaging_type": "RESPONSE",
 	}
-	b, _ := json.Marshal(payload)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf(
+		"https://graph.facebook.com/v25.0/%s/messages",
+		a.cfg.IGPageID,
+	)
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	q := req.URL.Query()
+	q.Set("access_token", strings.TrimSpace(a.cfg.IGPageAccessToken))
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode >= 300 {
-		bb, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("graph status=%d body=%s", resp.StatusCode, string(bb))
+		return fmt.Errorf("graph status=%d body=%s", resp.StatusCode, string(respBody))
 	}
+
 	return nil
 }
 
