@@ -74,6 +74,7 @@ func main() {
 	app := &App{cfg: cfg, db: db}
 	go app.followupWorker()
 
+	http.HandleFunc("/", app.handleHome)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -297,7 +298,7 @@ func trimTurns(turns []Turn, n int) []Turn {
 
 func (a *App) generateReply(turns []Turn) (string, error) {
 	if a.cfg.OpenAIAPIKey == "" {
-		return "Thanks for your message — we got it. A human will reply shortly.", nil
+		return "Thanks for your message! I can help with product details, availability, and next steps. What are you looking for today?", nil
 	}
 	type msg struct {
 		Role    string `json:"role"`
@@ -309,10 +310,10 @@ func (a *App) generateReply(turns []Turn) (string, error) {
 	}
 
 	payload := map[string]any{
-		"model":       a.cfg.OpenAIModel,
-		"messages":    messages,
-		"temperature": 0.6,
-		"max_tokens":  220,
+		"model":                 a.cfg.OpenAIModel,
+		"messages":              messages,
+		"temperature":           0.6,
+		"max_completion_tokens": 220,
 	}
 	b, _ := json.Marshal(payload)
 	req, _ := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(b))
@@ -471,6 +472,25 @@ func (a *App) listThreads() ([]ThreadState, error) {
 		})
 	})
 	return out, err
+}
+
+func (a *App) handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Insta Assistant</title></head>
+<body style="font-family:Arial,sans-serif;max-width:760px;margin:40px auto;line-height:1.6;padding:0 16px;">
+<h1>Insta Assistant</h1>
+<p>Instagram DM automation service.</p>
+<ul>
+  <li><a href="/health">Health</a></li>
+  <li><a href="/privacy">Privacy Policy</a></li>
+  <li><a href="/data-deletion">Data Deletion Instructions</a></li>
+</ul>
+</body></html>`))
 }
 
 func (a *App) handlePrivacy(w http.ResponseWriter, r *http.Request) {
